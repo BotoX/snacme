@@ -32,8 +32,8 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 
-LE_ACME_SERVER = 'https://acme-v01.api.letsencrypt.org'
-LE_STAGING_ACME_SERVER = 'https://acme-staging.api.letsencrypt.org'
+LE_ACME_SERVER = 'https://acme-v02.api.letsencrypt.org'
+LE_STAGING_ACME_SERVER = 'https://acme-staging-v02.api.letsencrypt.org'
 ACME_SERVER = LE_ACME_SERVER
 RENEW_DAYS = 30
 CA_CERT = None
@@ -80,22 +80,29 @@ def acme_b64encode(data):
 		return base64.urlsafe_b64encode(data.encode('utf8')).decode('ascii').rstrip('=')
 
 class ACMEClient():
-	def __init__(self, ca_uri, email=None):
-		self.ca_uri = ca_uri
+	def __init__(self, ca_url, email=None):
+		self.ca_url = ca_url
 		self.email = email
-		self.nonce = None
 
-		r = self.api_get(urllib.parse.urljoin(self.ca_uri, 'directory'))
+		r = self.api_get(urllib.parse.urljoin(self.ca_url, 'directory'))
 		if not r.ok:
 			raise ValueError('ACME error while getting directory: ({0})\n{1}'.format(r.status_code, r.text))
 		self.directory = r.json()
 
+		self.kid = None
 		self.privkey = None
 		self.pubkey = None
 		self.acme_register()
 
+	def acme_nonce(self):
+		r = self.api_get(self.directory['newNonce'])
+		if not r.ok:
+			raise ValueError('ACME error while requesting new nonce: ({0})\n{1}'.format(r.status_code, r.text))
+		nonce = r.headers['Replay-Nonce']
+		return nonce
+
 	def acme_register(self):
-		accpath = os.path.join('accounts', acme_b64encode(self.ca_uri + '/directory'))
+		accpath = os.path.join('accounts', acme_b64encode(self.ca_url + '/directory'))
 		if not os.path.isdir(accpath):
 			os.makedirs(accpath, mode=0o700)
 
@@ -116,17 +123,20 @@ class ACMEClient():
 		self.pubkey = self.privkey.public_key()
 
 		reginfo = os.path.join(accpath, 'registration_info.json')
-		if not os.path.isfile(reginfo):
-			logging.info('# Registering new account on %s', self.ca_uri)
+		if os.path.isfile(reginfo):
+			logging.info('# Using existing account: %s', reginfo)
+			with open(reginfo, 'r') as fp:
+				account = json.load(fp)
+		else:
+			logging.info('# Registering new account on %s', self.ca_url)
 
 			req = {
-				'resource': 'new-reg',
-				'agreement': self.directory['meta']['terms-of-service']
+				'termsOfServiceAgreed': True
 			}
 			if self.email:
 				req['contact'] = ['mailto:' + self.email]
 
-			r = self.api_post(self.directory['new-reg'], json.dumps(req))
+			r = self.api_post(self.directory['newAccount'], json.dumps(req))
 			if not r.ok:
 				abort = True
 				if r.status_code == 409 and r.headers['Content-Type'] == 'application/problem+json':
@@ -141,61 +151,77 @@ class ACMEClient():
 					raise ValueError('ACME error while registering account: ({0})\n{1}'.format(r.status_code, r.text))
 
 			account = r.json()
-			with open(reginfo, 'wb') as fp:
-				fp.write(r.content)
+			account['kid'] = r.headers['Location']
+			with open(reginfo, 'w') as fp:
+				json.dump(account, fp)
 			logging.info(' + Success!')
 
-	def acme_challenge(self, domain):
+		self.kid = account['kid']
+
+	def acme_order(self, domains):
 		req = {
-			'resource': 'new-authz',
-			'identifier': {
-				'type': 'dns',
-				'value': domain
-			}
+			'identifiers': [
+				{
+					'type': 'dns',
+					'value': domain
+				} for domain in domains
+			]
 		}
-		r = self.api_post(self.directory['new-authz'], json.dumps(req))
+		r = self.api_post(self.directory['newOrder'], json.dumps(req))
 		if not r.ok:
-			raise ValueError('ACME error while requesting challenge: ({0})\n{1}'.format(r.status_code, r.text))
+			raise ValueError('ACME error while creating order: ({0})\n{1}'.format(r.status_code, r.text))
+
+		resp = r.json()
+		return resp
+
+	def acme_get_challenge(self, url):
+		r = self.api_get(url)
+		if not r.ok:
+			raise ValueError('ACME error while getting challenge: ({0})\n{1}'.format(r.status_code, r.text))
 
 		# calculate keyauth right away, because why not
 		jwk_thumb = self.jwk_thumbprint()
 		resp = r.json()
 		for cha in resp['challenges']:
 			cha['keyauth'] = '{0}.{1}'.format(cha['token'], jwk_thumb)
+
 		return resp
 
-	def acme_notify(self, uri, authorization):
+	def acme_notify(self, url, authorization):
 		req = {
-			'resource': 'challenge',
 			'keyAuthorization': authorization
 		}
-		r = self.api_post(uri, json.dumps(req))
+		r = self.api_post(url, json.dumps(req))
 		if not r.ok:
 			raise ValueError('ACME error while notifying: ({0})\n{1}'.format(r.status_code, r.text))
 		return r.json()
 
-	def acme_check_challenge(self, uri):
-		r = self.api_get(uri)
+	def acme_check_challenge(self, url):
+		r = self.api_get(url)
 		if not r.ok:
 			raise ValueError('ACME error while checking challenge: ({0})\n{1}'.format(r.status_code, r.text))
 		return r.json()
 
-	def acme_get_certificate(self, csr):
+	def acme_finalize(self, url, csr):
 		req = {
-			'resource': 'new-cert',
 			'csr': acme_b64encode(csr)
 		}
-		r = self.api_post(self.directory['new-cert'], json.dumps(req))
+		r = self.api_post(url, json.dumps(req))
 		if not r.ok:
-			raise ValueError('ACME error while requesting certificate: ({0})\n{1}'.format(r.status_code, r.text))
-		return r.content
+			raise ValueError('ACME error while finalizing order: ({0})\n{1}'.format(r.status_code, r.text))
+		return r.json()
+
+	def acme_download_cert(self, url):
+		r = self.api_get(url)
+		if not r.ok:
+			raise ValueError('ACME error while downloading certificate: ({0})\n{1}'.format(r.status_code, r.text))
+		return r
 
 	def acme_revoke(self, der):
 		req = {
-			'resource': 'revoke-cert',
 			'certificate': acme_b64encode(der)
 		}
-		r = self.api_post(self.directory['revoke-cert'], json.dumps(req))
+		r = self.api_post(self.directory['revokeCert'], json.dumps(req))
 		if not r.ok:
 			raise ValueError('ACME error while revoking certificate: ({0})\n{1}'.format(r.status_code, r.text))
 
@@ -206,25 +232,27 @@ class ACMEClient():
 			hashes.SHA256()
 		)
 
-	def jws_header(self):
+	def jwk(self):
 		pubnums = self.pubkey.public_numbers()
 		return {
-			'alg': 'RS256',
-			'jwk': {
-				'e': acme_b64encode(pubnums.e.to_bytes(math.ceil(pubnums.e.bit_length() / 8), 'big')),
-				'kty': 'RSA',
-				'n': acme_b64encode(pubnums.n.to_bytes(self.pubkey.key_size // 8, 'big'))
-			}
+			'e': acme_b64encode(pubnums.e.to_bytes(math.ceil(pubnums.e.bit_length() / 8), 'big')),
+			'kty': 'RSA',
+			'n': acme_b64encode(pubnums.n.to_bytes(self.pubkey.key_size // 8, 'big'))
 		}
 
-	def jws_sign(self, payload):
-		if not self.nonce:
-			raise ValueError('No nonce available, you can\'t reuse them!')
+	def jws_header(self):
+		res = {'alg': 'RS256'}
+		if self.kid:
+			res['kid'] = self.kid
+		else:
+			res['jwk'] = self.jwk()
+		return res
 
+	def jws_sign(self, url, payload):
 		payload = acme_b64encode(payload)
 		protected = self.jws_header()
-		protected['nonce'] = self.nonce
-		self.nonce = None
+		protected['nonce'] = self.acme_nonce()
+		protected['url'] = url
 		protected = acme_b64encode(json.dumps(protected))
 		signature = '{0}.{1}'.format(protected, payload).encode('utf8')
 		signature = self.crypto_sign_msg(signature)
@@ -237,24 +265,26 @@ class ACMEClient():
 		}).encode('utf8')
 
 	def jwk_thumbprint(self):
-		jwk = self.jws_header()['jwk']
+		jwk = self.jwk()
 		jwk = json.dumps(jwk, sort_keys=True, separators=(',', ':'))
 		return acme_b64encode(hashlib.sha256(jwk.encode('utf8')).digest())
 
-	def _requests_request(self, method, uri, data=None):
+	def _requests_request(self, method, url, data=None, headers={}):
+		_headers = {'User-Agent': 'snacme/dev'}
+		_headers.update(headers)
 		try:
-			r = requests.request(method=method, url=uri, data=data, timeout=5, verify=CA_CERT)
+			r = requests.request(method=method, headers=_headers, url=url, data=data, timeout=5, verify=CA_CERT)
 		except Exception as e:
 			raise e
-		self.nonce = r.headers['Replay-Nonce']
 		return r
 
-	def api_get(self, uri):
-		return self._requests_request('GET', uri)
+	def api_get(self, url):
+		return self._requests_request('GET', url)
 
-	def api_post(self, uri, payload):
-		data = self.jws_sign(payload)
-		return self._requests_request('POST', uri, data)
+	def api_post(self, url, payload):
+		headers = {'Content-Type': 'application/jose+json'}
+		data = self.jws_sign(url, payload)
+		return self._requests_request('POST', url, data, headers)
 
 
 class HTTP01Challenger():
@@ -313,7 +343,7 @@ class DNS01CloudflareChallenger():
 
 	def deploy(self, chalist):
 		pending = []
-		uri = 'https://api.cloudflare.com/client/v4/zones/{0}/dns_records'.format(self.zone)
+		url = 'https://api.cloudflare.com/client/v4/zones/{0}/dns_records'.format(self.zone)
 		soll = len(chalist) - 1
 		for ist, cha in enumerate(chalist):
 			domain = cha['identifier']['value']
@@ -328,7 +358,7 @@ class DNS01CloudflareChallenger():
 				"content": "{0}".format(txt),
 				"ttl": 1
 			})
-			r = requests.post(uri, data=data, headers=self.headers)
+			r = requests.post(url, data=data, headers=self.headers)
 			if not r.ok:
 				logging.error(' ! Cloudflare API error while writing record: ({0})\n{1}'.format(r.status_code, r.text))
 				return False
@@ -378,11 +408,11 @@ class DNS01CloudflareChallenger():
 
 	def clean(self):
 		logging.info('# Challenge cleanup.')
-		uri = 'https://api.cloudflare.com/client/v4/zones/{0}/dns_records/'.format(self.zone)
+		url = 'https://api.cloudflare.com/client/v4/zones/{0}/dns_records/'.format(self.zone)
 		soll = len(self.needclean)
 		for ist, record in enumerate(self.needclean):
 			_progress(' + Progress:', ist + 1, soll)
-			r = requests.request('DELETE', uri + record, headers=self.headers)
+			r = requests.request('DELETE', url + record, headers=self.headers)
 			if not r.ok:
 				logging.error(' ! Cloudflare API error while deleting record: ({0})\n{1}'.format(r.status_code, r.text))
 		self.needclean.clear()
@@ -397,7 +427,7 @@ def main(args):
 
 	error = 0
 	issued = 0
-	client = ACMEClient(ca_uri=args.acme_server, email=args.email)
+	client = ACMEClient(ca_url=args.acme_server, email=args.email)
 
 	if args.revoke or args.revoke_all:
 		paths = []
@@ -465,8 +495,6 @@ def main(args):
 		keypath = os.path.abspath(os.path.join(certspath, 'privkey.pem'))
 		csrpath = os.path.abspath(os.path.join(certspath, 'cert.csr'))
 		certpath = os.path.abspath(os.path.join(certspath, 'cert.pem'))
-		chainpath = os.path.abspath(os.path.join(certspath, 'chain.pem'))
-		fullpath = os.path.abspath(os.path.join(certspath, 'fullchain.pem'))
 
 		cert = None
 		try:
@@ -512,12 +540,17 @@ def main(args):
 			error = 1
 			continue
 
-		logging.info('# Requesting challenge...')
+		logging.info('# Creating new order...')
+		order = client.acme_order(domains)
+		logging.info(' + Success!')
+
+		logging.info('# Requesting challenges...')
 		chalist = []
 		soll = len(domains)
-		for ist, domain in enumerate(domains):
+		for ist, url in enumerate(order['authorizations']):
+			domain = order['identifiers'][ist]['value']
 			_progress(' + Progress:', ist + 1, soll, domain)
-			chalist.append(client.acme_challenge(domain))
+			chalist.append(client.acme_get_challenge(url))
 
 		try:
 			logging.info('# Deploying challenge...')
@@ -534,7 +567,7 @@ def main(args):
 				mycha = next((i for i in cha['challenges'] if i['type'] == chatype), None)
 
 				_progress(' + Progress:', ist + 1, soll, domain)
-				res = client.acme_notify(mycha['uri'], mycha['keyauth'])
+				res = client.acme_notify(mycha['url'], mycha['keyauth'])
 				if res['status'] == 'invalid':
 					_progress(' + Progress:', ist + 1, soll, domain, True)
 					logging.error(' ! received \'invalid\' status: %s', res)
@@ -550,7 +583,7 @@ def main(args):
 			ist, soll = 0, len(pending)
 			while pending and not stop:
 				for mycha in pending[:]:
-					res = client.acme_check_challenge(mycha['uri'])
+					res = client.acme_check_challenge(mycha['url'])
 					if res['status'] == 'invalid':
 						_progress(' + Progress:', ist, soll, '[{0}/{1} tries]'.format(tries, maxtries), True)
 						logging.error(' ! received \'invalid\' status: %s', res)
@@ -603,55 +636,25 @@ def main(args):
 		with open(os.path.join(certspath, 'cert-{}.csr'.format(now)), 'wb') as fp:
 			fp.write(csr.public_bytes(serialization.Encoding.PEM))
 
-		logging.info('# Requesting signed certificate...')
-		res = client.acme_get_certificate(csr.public_bytes(serialization.Encoding.DER))
+		logging.info('# Finalizing order...')
+		order = client.acme_finalize(order['finalize'], csr.public_bytes(serialization.Encoding.DER))
 		logging.info(' + Success!')
-		pem = '-----BEGIN CERTIFICATE-----\n{0}\n-----END CERTIFICATE-----\n'.format(
-			'\n'.join(textwrap.wrap(base64.b64encode(res).decode('utf8'), 64))).encode('utf8')
+
+		logging.info('# Downloading signed certificate...')
+		pem = client.acme_download_cert(order['certificate']).content
+		logging.info(' + Success!')
+
 		with open(os.path.join(certspath, 'cert-{}.pem'.format(now)), 'wb') as fp:
 			fp.write(pem)
-
-		cert = x509.load_pem_x509_certificate(pem, default_backend())
-		cainfo = cert.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
-		chainurl = next((i for i in cainfo if i.access_method == AuthorityInformationAccessOID.CA_ISSUERS), None).access_location.value
-		ocspurl = next((i for i in cainfo if i.access_method == AuthorityInformationAccessOID.OCSP), None).access_location.value
-
-		logging.info('# Retrieving intermediate certificate...')
-		chain = None
-		try:
-			r = requests.get(chainurl, timeout=5, verify=CA_CERT)
-			r.raise_for_status()
-			chain = r.content
-		except Exception as e:
-			logging.error(' + Error while retrieving intermediate cert from: %s\n%s', chainurl, e)
-			error = 1
-			continue
-		logging.info(' + Success!')
-		issued += 1
-
-		if chain:
-			cpem = '{0}\n-----BEGIN CERTIFICATE-----\n{1}\n-----END CERTIFICATE-----\n'.format(
-				chainurl, '\n'.join(textwrap.wrap(base64.b64encode(chain).decode('utf8'), 64))
-				).encode('utf8')
-			with open(os.path.join(certspath, 'chain-{}.pem'.format(now)), 'wb') as fp:
-				fp.write(cpem)
-			with open(os.path.join(certspath, 'fullchain-{}.pem'.format(now)), 'wb') as fp:
-				fp.write(pem)
-				fp.write(b'\n')
-				fp.write(cpem)
 
 		os.removef(keypath)
 		os.removef(csrpath)
 		os.removef(certpath)
-		os.removef(chainpath)
-		os.removef(fullpath)
 
 		os.symlink('privkey-{}.pem'.format(now), keypath)
 		os.symlink('cert-{}.csr'.format(now), csrpath)
 		os.symlink('cert-{}.pem'.format(now), certpath)
-		if chain:
-			os.symlink('chain-{}.pem'.format(now), chainpath)
-			os.symlink('fullchain-{}.pem'.format(now), fullpath)
+		issued += 1
 
 		copy = obj.get('copy', None)
 		if copy:
@@ -663,14 +666,10 @@ def main(args):
 				path = path.replace('{name}', name)
 				logging.info('# Copying certificate to: {}'.format(path))
 				shutil.copy2(certpath, path)
-			for path in _itery(copy.get('fullchain', None)):
-				path = path.replace('{name}', name)
-				logging.info('# Copying full certificate to: {}'.format(path))
-				shutil.copy2(fullpath, path)
 
 		for cmd in _itery(obj.get('deploy', None)):
 			cmd = cmd.replace('{name}', name) \
-					.replace('{privkey}', keypath).replace('{cert}', certpath).replace('{fullchain}', fullpath)
+					.replace('{privkey}', keypath).replace('{cert}', certpath)
 			logging.info('# Running deploy script: %s', cmd)
 			r = subprocess.run(cmd, shell=True)
 			if r.returncode != 0:
@@ -698,7 +697,7 @@ if __name__ == "__main__":
 	parser.add_argument('-ra', '--revoke-all', action='store_true', help='revoke all certificates')
 	parser.add_argument('--email', help='e-mail address used for account registration')
 	parser.add_argument('--staging', action='store_true', help='use Let\'s Encrypt staging server')
-	parser.add_argument('--acme-server', metavar='URI', default=None, help='custom ACME server')
+	parser.add_argument('--acme-server', metavar='URL', default=None, help='custom ACME server')
 	parser.add_argument('--ca-cert', metavar='PEM', help='custom ca-cert for ACME server')
 	parser.add_argument('-v', '--verbose', action='store_true', help='debug verbosity')
 	args = parser.parse_args()

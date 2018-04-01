@@ -7,8 +7,6 @@ Domain related files are stored in `certs/<name>/`:
 - privkey.pem: Domain private key, new one generated for every certificate.
 - cert.csr: Certificate signing request
 - cert.pem: Signed certificate
-- chain.pem: Intermediate certificate
-- fullchain.pem: Concatenated signed certificate and intermediate certificate (use this for nginx)
 
 These are actually symlinks to the latest version of the file, which is stored as `filename-unixtime.ext` and never deleted.
 
@@ -66,29 +64,28 @@ domains:
       a.example.com: /var/www/example.com/a/.well-known/acme-challenge
     copy:
       privkey: /etc/ssl/private/{name}.key
-      cert: /etc/ssl/private/{name}.crt
-      fullchain:
+      cert:
         - /etc/ssl/private/{name}.pem
         - /etc/nginx/ssl/{name}.pem
     deploy:
-      - cat {privkey} {fullchain} > /home/znc/.znc/znc.pem
+      - cat {privkey} {cert} > /home/znc/.znc/znc.pem
       - |
         sftp -oIdentityFile=~/.ssh/id_ed25519_sslsync root@remote.server <<EOF
           put {privkey} /etc/ssl/private/{name}.key
-          put {fullchain} /etc/ssl/private/{name}.pem
+          put {cert} /etc/ssl/private/{name}.pem
         EOF
 
   name2:
     disabled: true
     domains:
       - example2.com
-      - www.example2.com
+      - "*.example2.com"
     challenge: dns-01
     dns-01:
       # name: example2.com # if the domains list only has subdomains
       email: admin@example.com
       key: bfb3c49054cf3ec1e1fe101cea1f45b6
-    deploy: ./deploy.sh {name} {privkey} {cert} {fullchain}
+    deploy: ./deploy.sh {name} {privkey} {cert}
 
 alldone:
   - systemctl reload nginx
