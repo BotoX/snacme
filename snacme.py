@@ -421,7 +421,7 @@ class DNS01CloudflareChallenger():
 def main(args):
 	with open(args.config, 'r') as fp:
 		if yaml and (args.config.endswith('.yaml') or args.config.endswith('.yml')):
-			config = yaml.load(fp)
+			config = yaml.full_load(fp)
 		else:
 			config = json.load(fp)
 
@@ -517,7 +517,7 @@ def main(args):
 			timeleft = cert.not_valid_after - datetime.datetime.now()
 			logging.info(' + Certificate expires on: %s (%d days)', cert.not_valid_after, timeleft.days)
 			if timeleft.days < RENEW_DAYS:
-				logging.info('  * Less than %d days!', cert.not_valid_after)
+				logging.info('  * Less than %d days!', RENEW_DAYS)
 				if not renew:
 					logging.info('  * Renewing!')
 					renew = True
