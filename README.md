@@ -19,7 +19,7 @@ The script will not regenerate certificates unless forced or a certificate expir
 - python3-dnspython (for dns-01 cloudflare hook)
 - python3-yaml (only if using .yaml config)
 
-Debian: `apt-get install python3-cryptography python3-requests python3-dnspython python3-yaml`
+Debian: `apt-get install python3-cryptography python3-requests python3-dnspython python3-yaml`  
 Archlinux: `pacman -S python-cryptography python-requests python-dnspython python-yaml`
 
 

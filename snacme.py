@@ -334,8 +334,8 @@ class DNS01CloudflareChallenger():
 		}
 
 		self.domain = min(self.domains, key=len)
-		if 'domain' in self.config:
-			self.domain = self.config['domain']
+		if 'name' in self.config:
+			self.domain = self.config['name']
 		r = requests.get('https://api.cloudflare.com/client/v4/zones?name={0}'.format(self.domain), headers=self.headers)
 		if not r.ok:
 			raise ValueError('Cloudflare API error while getting zone: ({0})\n{1}'.format(r.status_code, r.text))
@@ -421,7 +421,10 @@ class DNS01CloudflareChallenger():
 def main(args):
 	with open(args.config, 'r') as fp:
 		if yaml and (args.config.endswith('.yaml') or args.config.endswith('.yml')):
-			config = yaml.full_load(fp)
+			try:
+				config = yaml.full_load(fp)
+			except AttributeError:
+				config = yaml.load(fp)
 		else:
 			config = json.load(fp)
 
