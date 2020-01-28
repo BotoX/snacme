@@ -1,8 +1,9 @@
 # snacme - Minimal Python3 ACME client
 Supports http-01 challenge with webroot and dns-01 challenge using the Cloudflare API.
 
-[Python cryptography](https://cryptography.io/en/latest/) is used to generate 4096 bit account and domain private keys.
-The account key is generated automatically and saved under `accounts/<base64(ACME-server-uri)>/account_key.pem`.
+[Python cryptography](https://cryptography.io/en/latest/) is used to generate RSA-2048/4096 or ECC-256/384 account and domain private keys.  
+The account key is generated automatically and saved under `accounts/<base64(ACME-server-uri)>/<key-type>/account_key.pem`.  
+The default key algorithm is `ec-384`, also known as P-384 or secp384r1.  
 Domain related files are stored in `certs/<name>/`:
 - privkey.pem: Domain private key, new one generated for every certificate.
 - cert.csr: Certificate signing request
@@ -17,7 +18,7 @@ The script will not regenerate certificates unless forced or a certificate expir
 - python3-cryptography
 - python3-requests
 - python3-dnspython (for dns-01 cloudflare hook)
-- python3-yaml (only if using .yaml config)
+- python3-yaml (if using .yaml config)
 
 Debian: `apt-get install python3-cryptography python3-requests python3-dnspython python3-yaml`  
 Archlinux: `pacman -S python-cryptography python-requests python-dnspython python-yaml`
@@ -25,9 +26,8 @@ Archlinux: `pacman -S python-cryptography python-requests python-dnspython pytho
 
 ### Usage
 ```
-usage: snacme.py [-h] [-c CONFIG] [-f] [-fo name] [-r name] [-ra]
-                 [--email EMAIL] [--staging] [--acme-server URI]
-                 [--ca-cert PEM] [-v]
+usage: snacme.py [-h] [-c CONFIG] [-f] [-fo name] [-r name] [-ra] [-t type]
+                 [--email EMAIL] [--staging] [--acme-server URL] [--ca-cert PEM] [-v]
 
 snacme - Minimal Python3 ACME client
 
@@ -41,11 +41,15 @@ optional arguments:
   -r name, --revoke name
                         revoke one certificate
   -ra, --revoke-all     revoke all certificates
+  -t type, --key-type type
+                        Key type to generate. Valid choices: rsa-2048, rsa-4096, ec-256,
+                        ec-384 (default: ec-384)
   --email EMAIL         e-mail address used for account registration
   --staging             use Let's Encrypt staging server
-  --acme-server URI     custom ACME server
+  --acme-server URL     custom ACME server
   --ca-cert PEM         custom ca-cert for ACME server
   -v, --verbose         debug verbosity
+
 ```
 
 ### Config file

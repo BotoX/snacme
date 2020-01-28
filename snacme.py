@@ -12,7 +12,6 @@ import hashlib
 import urllib.parse
 import requests
 import json
-import textwrap
 import contextlib
 import socket
 import shutil
@@ -27,16 +26,23 @@ except ImportError:
 	dns = None
 
 from cryptography import x509
+from cryptography.utils import int_to_bytes
 from cryptography.x509.oid import NameOID, ExtensionOID, AuthorityInformationAccessOID
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding, utils
 
 LE_ACME_SERVER = 'https://acme-v02.api.letsencrypt.org'
 LE_STAGING_ACME_SERVER = 'https://acme-staging-v02.api.letsencrypt.org'
 ACME_SERVER = LE_ACME_SERVER
 RENEW_DAYS = 30
 CA_CERT = None
+SUPPORTED_CRYPTO = {
+	'rsa-2048': ('rsa', 2048),
+	'rsa-4096': ('rsa', 4096),
+	'ec-256': ('ec', 256),
+	'ec-384': ('ec', 384)
+}
 
 def _progress(prefix, val, end, postfix='', abort=False):
 	sys.stderr.write(' ' * _progress.lastlen + '\r')
@@ -60,12 +66,26 @@ def __os_removef(*args, **kwargs):
 		os.remove(*args, **kwargs)
 os.removef = __os_removef
 
-def generate_rsa_key(bits=4096):
-	pkey = rsa.generate_private_key(
-		public_exponent=65537,
-		key_size=bits,
-		backend=default_backend()
-	)
+def generate_key(algo, bits):
+	if algo == 'rsa':
+		pkey = rsa.generate_private_key(
+			public_exponent=65537,
+			key_size=bits,
+			backend=default_backend()
+		)
+	elif algo == 'ec':
+		curves = {
+			256: ec.SECP256R1(),
+			384: ec.SECP384R1(),
+			521: ec.SECP521R1()
+		}
+		pkey = ec.generate_private_key(
+			curve=curves[bits],
+			backend=default_backend()
+		)
+	else:
+		raise ValueError('Unknown cryptography: {0}'.format(algo))
+
 	pem = pkey.private_bytes(
 		encoding=serialization.Encoding.PEM,
 		format=serialization.PrivateFormat.PKCS8,
@@ -80,9 +100,11 @@ def acme_b64encode(data):
 		return base64.urlsafe_b64encode(data.encode('utf8')).decode('ascii').rstrip('=')
 
 class ACMEClient():
-	def __init__(self, ca_url, email=None):
+	def __init__(self, ca_url, algo, email=None):
 		self.ca_url = ca_url
 		self.email = email
+		self._algo = algo
+		self.algo, self.bits = SUPPORTED_CRYPTO[algo]
 
 		r = self.api_get(urllib.parse.urljoin(self.ca_url, 'directory'))
 		if not r.ok:
@@ -95,14 +117,14 @@ class ACMEClient():
 		self.acme_register()
 
 	def acme_nonce(self):
-		r = self.api_get(self.directory['newNonce'])
+		r = self.api_head(self.directory['newNonce'])
 		if not r.ok:
 			raise ValueError('ACME error while requesting new nonce: ({0})\n{1}'.format(r.status_code, r.text))
 		nonce = r.headers['Replay-Nonce']
 		return nonce
 
 	def acme_register(self):
-		accpath = os.path.join('accounts', acme_b64encode(self.ca_url + '/directory'))
+		accpath = os.path.join('accounts', acme_b64encode(self.ca_url + '/directory'), self._algo)
 		if not os.path.isdir(accpath):
 			os.makedirs(accpath, mode=0o700)
 
@@ -117,7 +139,7 @@ class ACMEClient():
 				)
 		else:
 			logging.info('# Generating new account private key...')
-			self.privkey, pem = generate_rsa_key()
+			self.privkey, pem = generate_key(self.algo, self.bits)
 			with open(os.open(acckey, os.O_WRONLY | os.O_CREAT, 0o600), 'wb') as fp:
 				fp.write(pem)
 		self.pubkey = self.privkey.public_key()
@@ -175,7 +197,7 @@ class ACMEClient():
 		return resp
 
 	def acme_get_challenge(self, url):
-		r = self.api_get(url)
+		r = self.api_post(url, None) # POST-as-GET
 		if not r.ok:
 			raise ValueError('ACME error while getting challenge: ({0})\n{1}'.format(r.status_code, r.text))
 
@@ -197,7 +219,7 @@ class ACMEClient():
 		return r.json()
 
 	def acme_check_challenge(self, url):
-		r = self.api_get(url)
+		r = self.api_post(url, None) # POST-as-GET
 		if not r.ok:
 			raise ValueError('ACME error while checking challenge: ({0})\n{1}'.format(r.status_code, r.text))
 		return r.json()
@@ -212,7 +234,7 @@ class ACMEClient():
 		return r.json()
 
 	def acme_download_cert(self, url):
-		r = self.api_get(url)
+		r = self.api_post(url, None) # POST-as-GET
 		if not r.ok:
 			raise ValueError('ACME error while downloading certificate: ({0})\n{1}'.format(r.status_code, r.text))
 		return r
@@ -226,22 +248,46 @@ class ACMEClient():
 			raise ValueError('ACME error while revoking certificate: ({0})\n{1}'.format(r.status_code, r.text))
 
 	def crypto_sign_msg(self, msg):
-		return self.privkey.sign(
-			msg,
-			padding.PKCS1v15(),
-			hashes.SHA256()
-		)
+		if self.algo == 'rsa':
+			return self.privkey.sign(
+				msg,
+				padding.PKCS1v15(),
+				hashes.SHA256()
+			)
+		elif self.algo == 'ec':
+			hash_algos = {
+				256: hashes.SHA256(),
+				384: hashes.SHA384(),
+				521: hashes.SHA512()
+			}
+			sig_der = self.privkey.sign(
+				msg,
+				ec.ECDSA(hash_algos[self.bits])
+			)
+			r, s = utils.decode_dss_signature(sig_der)
+			return int_to_bytes(r) + int_to_bytes(s)
 
 	def jwk(self):
 		pubnums = self.pubkey.public_numbers()
-		return {
-			'e': acme_b64encode(pubnums.e.to_bytes(math.ceil(pubnums.e.bit_length() / 8), 'big')),
-			'kty': 'RSA',
-			'n': acme_b64encode(pubnums.n.to_bytes(self.pubkey.key_size // 8, 'big'))
-		}
+		if self.algo == 'rsa':
+			return {
+				'kty': 'RSA',
+				'n': acme_b64encode(int_to_bytes(pubnums.n)),
+				'e': acme_b64encode(int_to_bytes(pubnums.e))
+			}
+		elif self.algo == 'ec':
+			return {
+				'kty': 'EC',
+				'crv': 'P-{0}'.format(self.bits),
+				'x': acme_b64encode(int_to_bytes(pubnums.x)),
+				'y': acme_b64encode(int_to_bytes(pubnums.y))
+ 		}
 
 	def jws_header(self):
-		res = {'alg': 'RS256'}
+		if self.algo == 'rsa':
+			res = {'alg': 'RS256'}
+		elif self.algo == 'ec':
+			res = {'alg': 'ES{0}'.format(self.bits)}
 		if self.kid:
 			res['kid'] = self.kid
 		else:
@@ -249,7 +295,10 @@ class ACMEClient():
 		return res
 
 	def jws_sign(self, url, payload):
-		payload = acme_b64encode(payload)
+		if payload is not None:
+			payload = acme_b64encode(payload)
+		else: # POST-as-GET
+			payload = ''
 		protected = self.jws_header()
 		protected['nonce'] = self.acme_nonce()
 		protected['url'] = url
@@ -277,6 +326,9 @@ class ACMEClient():
 		except Exception as e:
 			raise e
 		return r
+
+	def api_head(self, url):
+		return self._requests_request('HEAD', url)
 
 	def api_get(self, url):
 		return self._requests_request('GET', url)
@@ -420,7 +472,9 @@ class DNS01CloudflareChallenger():
 
 def main(args):
 	with open(args.config, 'r') as fp:
-		if yaml and (args.config.endswith('.yaml') or args.config.endswith('.yml')):
+		if args.config.endswith('.yaml') or args.config.endswith('.yml'):
+			if yaml is None:
+				raise ValueError('YAML config specified but python-yaml not installed!')
 			try:
 				config = yaml.full_load(fp)
 			except AttributeError:
@@ -430,7 +484,7 @@ def main(args):
 
 	error = 0
 	issued = 0
-	client = ACMEClient(ca_url=args.acme_server, email=args.email)
+	client = ACMEClient(ca_url=args.acme_server, email=args.email, algo=args.key_type)
 
 	if args.revoke or args.revoke_all:
 		paths = []
@@ -614,14 +668,14 @@ def main(args):
 				continue
 
 			logging.info(' + Valid!')
-		except KeyboardInterrupt:
+		except (ValueError, KeyboardInterrupt):
 			challenger.clean()
-			return error
+			return 1
 		challenger.clean()
 
 		now = int(time.time())
 		logging.info('# Generating private key...')
-		privkey, pem = generate_rsa_key()
+		privkey, pem = generate_key(client.algo, client.bits)
 		with open(os.open(os.path.join(certspath, 'privkey-{}.pem'.format(now)), os.O_WRONLY | os.O_CREAT, 0o600), 'wb') as fp:
 			fp.write(pem)
 
@@ -677,7 +731,7 @@ def main(args):
 			r = subprocess.run(cmd, shell=True)
 			if r.returncode != 0:
 				logging.info(' ! Returned with non-zero returncode: %s', r.returncode)
-				error = True
+				error = 1
 		logging.info('----- ----- -----')
 
 	if issued > 0:
@@ -686,7 +740,7 @@ def main(args):
 			r = subprocess.run(cmd, shell=True)
 			if r.returncode != 0:
 				logging.info(' ! Returned with non-zero returncode: %s', r.returncode)
-				error = True
+				error = 1
 
 	return error
 
@@ -698,6 +752,9 @@ if __name__ == "__main__":
 	parser.add_argument('-fo', '--force-one', metavar='name', help='force renew one certificate')
 	parser.add_argument('-r', '--revoke', metavar='name', help='revoke one certificate')
 	parser.add_argument('-ra', '--revoke-all', action='store_true', help='revoke all certificates')
+	parser.add_argument('-t', '--key-type', default='ec-384', metavar='type',
+		choices=SUPPORTED_CRYPTO.keys(),
+		help='Key type to generate. Valid choices: %(choices)s (default: %(default)s)')
 	parser.add_argument('--email', help='e-mail address used for account registration')
 	parser.add_argument('--staging', action='store_true', help='use Let\'s Encrypt staging server')
 	parser.add_argument('--acme-server', metavar='URL', default=None, help='custom ACME server')
