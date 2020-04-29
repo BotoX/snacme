@@ -264,8 +264,9 @@ class ACMEClient():
 				msg,
 				ec.ECDSA(hash_algos[self.bits])
 			)
+			num_bytes = (self.bits + 7) // 8
 			r, s = utils.decode_dss_signature(sig_der)
-			return int_to_bytes(r) + int_to_bytes(s)
+			return int_to_bytes(r, num_bytes) + int_to_bytes(s, num_bytes)
 
 	def jwk(self):
 		pubnums = self.pubkey.public_numbers()
@@ -322,7 +323,7 @@ class ACMEClient():
 		_headers = {'User-Agent': 'snacme/dev'}
 		_headers.update(headers)
 		try:
-			r = requests.request(method=method, headers=_headers, url=url, data=data, timeout=5, verify=CA_CERT)
+			r = requests.request(method=method, headers=_headers, url=url, data=data, timeout=30, verify=CA_CERT)
 		except Exception as e:
 			raise e
 		return r
@@ -431,7 +432,7 @@ class DNS01CloudflareChallenger():
 		resolver = dns.resolver.Resolver()
 		resolver.nameservers = dns_servers
 
-		tries, maxtries = 1, 10
+		tries, maxtries = 1, 15
 		okay = True
 		ist, soll = 0, len(pending)
 		while pending and okay:
@@ -551,7 +552,9 @@ def main(args):
 
 		keypath = os.path.abspath(os.path.join(certspath, 'privkey.pem'))
 		csrpath = os.path.abspath(os.path.join(certspath, 'cert.csr'))
+		fullchainpath = os.path.abspath(os.path.join(certspath, 'fullchain.pem'))
 		certpath = os.path.abspath(os.path.join(certspath, 'cert.pem'))
+		chainpath = os.path.abspath(os.path.join(certspath, 'chain.pem'))
 
 		cert = None
 		try:
@@ -635,7 +638,7 @@ def main(args):
 					pending.append(mycha)
 
 			logging.info('# Waiting for %d pending challenges...', len(pending))
-			tries, maxtries = 1, 10
+			tries, maxtries = 1, 15
 			stop = False
 			ist, soll = 0, len(pending)
 			while pending and not stop:
@@ -701,32 +704,43 @@ def main(args):
 		pem = client.acme_download_cert(order['certificate']).content
 		logging.info(' + Success!')
 
-		with open(os.path.join(certspath, 'cert-{}.pem'.format(now)), 'wb') as fp:
+		with open(os.path.join(certspath, 'fullchain-{}.pem'.format(now)), 'wb') as fp:
 			fp.write(pem)
+
+		# Generate cert.pem and chain.pem from fullchain.pem
+		pem_parts = re.findall(b'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----\n', pem, re.DOTALL)
+
+		with open(os.path.join(certspath, 'cert-{}.pem'.format(now)), 'wb') as fp:
+			fp.write(pem_parts[0])
+
+		with open(os.path.join(certspath, 'chain-{}.pem'.format(now)), 'wb') as fp:
+			fp.write(b'\n'.join(pem_parts[1:]))
 
 		os.removef(keypath)
 		os.removef(csrpath)
+		os.removef(fullchainpath)
 		os.removef(certpath)
+		os.removef(chainpath)
 
 		os.symlink('privkey-{}.pem'.format(now), keypath)
 		os.symlink('cert-{}.csr'.format(now), csrpath)
+		os.symlink('fullchain-{}.pem'.format(now), fullchainpath)
 		os.symlink('cert-{}.pem'.format(now), certpath)
+		os.symlink('chain-{}.pem'.format(now), chainpath)
 		issued += 1
 
 		copy = obj.get('copy', None)
 		if copy:
-			for path in _itery(copy.get('privkey', None)):
-				path = path.replace('{name}', name)
-				logging.info('# Copying private key to: {}'.format(path))
-				shutil.copy2(keypath, path)
-			for path in _itery(copy.get('cert', None)):
-				path = path.replace('{name}', name)
-				logging.info('# Copying certificate to: {}'.format(path))
-				shutil.copy2(certpath, path)
+			for key, path in [('privkey', keypath), ('fullchain', fullchainpath), ('cert', certpath), ('chain', chainpath)]:
+				for target in _itery(copy.get(key, None)):
+					target = target.replace('{name}', name)
+					logging.info('# Copying {} key to: {}'.format(key, path))
+					shutil.copy2(path, target)
 
 		for cmd in _itery(obj.get('deploy', None)):
 			cmd = cmd.replace('{name}', name) \
-					.replace('{privkey}', keypath).replace('{cert}', certpath)
+					.replace('{privkey}', keypath).replace('{fullchain}', fullchainpath) \
+					.replace('{cert}', certpath).replace('{chain}', chainpath)
 			logging.info('# Running deploy script: %s', cmd)
 			r = subprocess.run(cmd, shell=True)
 			if r.returncode != 0:
