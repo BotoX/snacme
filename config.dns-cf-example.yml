@@ -1,0 +1,16 @@
+domains:
+  example.com:
+    domains:
+      - example.com
+      - "*.example.com"
+    challenge: dns-01
+    dns-01:
+      # name: example.com # if the domains list only has subdomains
+      email: "admin@example.com"
+      key: "api-key-here"
+    copy:
+      privkey: /etc/ssl/private/{name}.key
+      fullchain: /etc/ssl/private/{name}.pem
+
+alldone:
+  - systemctl reload nginx

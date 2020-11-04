@@ -1,0 +1,14 @@
+domains:
+  example.com:
+    domains:
+      - example.com
+      - www.example.com
+    challenge: http-01
+    http-01:
+      default: /var/www/.well-known/acme-challenge
+    copy:
+      privkey: /etc/ssl/private/{name}.key
+      fullchain: /etc/ssl/private/{name}.pem
+
+alldone:
+  - systemctl reload nginx

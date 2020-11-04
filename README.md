@@ -55,7 +55,7 @@ optional arguments:
 ```
 
 ### Config file
-Default = `config.json` or `config.yaml` or `config.yml`, in this order.
+Default = `config.json` or `config.yaml` or `config.yml`, in this order.  
 Can be either json (.json) or yaml (.yaml or .yml)
 ```
 domains:
@@ -66,10 +66,11 @@ domains:
       - a.example.com
     challenge: http-01
     http-01:
-      default: /var/www/example.com/htdocs/.well-known/acme-challenge
+      default: /var/www/.well-known/acme-challenge
       a.example.com: /var/www/example.com/a/.well-known/acme-challenge
     copy:
       privkey: /etc/ssl/private/{name}.key
+      cert: /etc/ssl/private/{name}.crt
       fullchain:
         - /etc/ssl/private/{name}.pem
         - /etc/nginx/ssl/{name}.pem
@@ -96,4 +97,30 @@ domains:
 alldone:
   - systemctl reload nginx
   - systemctl restart vsftpd
+```
+
+### systemd example
+`/etc/systemd/system/snacme.timer`
+```
+[Unit]
+Description=Run snacme cronjob every week.
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`/etc/systemd/system/snacme.service`
+```
+[Unit]
+Description=Run snacme cronjob
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/snacme
+ExecStart=/root/snacme/snacme.py
 ```

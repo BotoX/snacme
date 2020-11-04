@@ -392,6 +392,10 @@ class DNS01CloudflareChallenger():
 		r = requests.get('https://api.cloudflare.com/client/v4/zones?name={0}'.format(self.domain), headers=self.headers)
 		if not r.ok:
 			raise ValueError('Cloudflare API error while getting zone: ({0})\n{1}'.format(r.status_code, r.text))
+		if not r.json()['result']:
+			logging.error('\t! Using Cloudflare domain name: {0}'.format(self.domain))
+			logging.error('\t! Is this correct? Use "name" in "dns-01" challenge otherwise.')
+			raise ValueError('Cloudflare API returned empty result!')
 		self.zone = r.json()['result'][0]['id']
 
 	def deploy(self, chalist):
@@ -426,7 +430,7 @@ class DNS01CloudflareChallenger():
 				time.sleep(1)
 			return True
 
-		dns_servers = dns.resolver.query(self.domain, 'NS')
+		dns_servers = dns.resolver.resolve(self.domain, 'NS')
 		dns_servers = [i.to_text() for i in dns_servers]
 		dns_servers = [socket.gethostbyname(i) for i in dns_servers]
 		resolver = dns.resolver.Resolver()
@@ -438,7 +442,7 @@ class DNS01CloudflareChallenger():
 		while pending and okay:
 			for domain, txt in pending[:]:
 				try:
-					r = resolver.query(domain, 'TXT')
+					r = resolver.resolve(domain, 'TXT')
 					for res in r:
 						if txt in [i.decode('utf8') for i in res.strings]:
 							pending.remove((domain, txt))
@@ -734,7 +738,7 @@ def main(args):
 			for key, path in [('privkey', keypath), ('fullchain', fullchainpath), ('cert', certpath), ('chain', chainpath)]:
 				for target in _itery(copy.get(key, None)):
 					target = target.replace('{name}', name)
-					logging.info('# Copying {} key to: {}'.format(key, path))
+					logging.info('# Copying {} key to: {}'.format(key, target))
 					shutil.copy2(path, target)
 
 		for cmd in _itery(obj.get('deploy', None)):
