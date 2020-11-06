@@ -22,6 +22,9 @@ except ImportError:
 	yaml = None
 try:
 	import dns.resolver
+	if not hasattr(dns.resolver, 'resolve'):
+		dns.resolver.resolve = dns.resolver.query
+		dns.resolver.Resolver.resolve = dns.resolver.Resolver.query
 except ImportError:
 	dns = None
 
@@ -675,10 +678,10 @@ def main(args):
 				continue
 
 			logging.info(' + Valid!')
-		except (ValueError, KeyboardInterrupt):
-			challenger.clean()
+		except KeyboardInterrupt:
 			return 1
-		challenger.clean()
+		finally:
+			challenger.clean()
 
 		now = int(time.time())
 		logging.info('# Generating private key...')
