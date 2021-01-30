@@ -1,4 +1,4 @@
-domains:
+certificates:
   example.com:
     domains:
       - example.com

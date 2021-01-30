@@ -7,7 +7,6 @@ import datetime
 import logging
 import argparse
 import base64
-import math
 import hashlib
 import urllib.parse
 import requests
@@ -38,7 +37,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding, utils
 LE_ACME_SERVER = 'https://acme-v02.api.letsencrypt.org'
 LE_STAGING_ACME_SERVER = 'https://acme-staging-v02.api.letsencrypt.org'
 ACME_SERVER = LE_ACME_SERVER
-RENEW_DAYS = 30
+RENEW_DAYS_MIN = 30
+KEY_ROTATE_DAYS = 30
 CA_CERT = None
 SUPPORTED_CRYPTO = {
 	'rsa-2048': ('rsa', 2048),
@@ -96,6 +96,14 @@ def generate_key(algo, bits):
 	)
 	return pkey, pem
 
+def load_key(path):
+	with open(path, 'rb') as fp:
+		return serialization.load_pem_private_key(
+			fp.read(),
+			password=None,
+			backend=default_backend()
+		)
+
 def acme_b64encode(data):
 	if isinstance(data, bytes):
 		return base64.urlsafe_b64encode(data).decode('ascii').rstrip('=')
@@ -134,12 +142,7 @@ class ACMEClient():
 		acckey = os.path.join(accpath, 'account_key.pem')
 		if os.path.isfile(acckey):
 			logging.debug('# Using existing account private key: %s', acckey)
-			with open(acckey, 'rb') as fp:
-				self.privkey = serialization.load_pem_private_key(
-					fp.read(),
-					password=None,
-					backend=default_backend()
-				)
+			self.privkey = load_key(acckey)
 		else:
 			logging.info('# Generating new account private key...')
 			self.privkey, pem = generate_key(self.algo, self.bits)
@@ -376,7 +379,8 @@ class HTTP01Challenger():
 	def clean(self):
 		logging.info('# Challenge cleanup.')
 		for path in self.needclean:
-			os.remove(path)
+			os.removef(path)
+		self.needclean.clear()
 
 class DNS01CloudflareChallenger():
 	def __init__(self, config, domains):
@@ -388,6 +392,13 @@ class DNS01CloudflareChallenger():
 			'X-Auth-Email': self.config['email'],
 			'X-Auth-Key': self.config['key']
 		}
+		self.zone = ''
+		self.initialized = False
+
+	def init(self):
+		if self.initialized:
+			return
+		self.initialized = True
 
 		self.domain = min(self.domains, key=len)
 		if 'name' in self.config:
@@ -402,14 +413,15 @@ class DNS01CloudflareChallenger():
 		self.zone = r.json()['result'][0]['id']
 
 	def deploy(self, chalist):
+		self.init()
 		pending = []
 		url = 'https://api.cloudflare.com/client/v4/zones/{0}/dns_records'.format(self.zone)
-		soll = len(chalist) - 1
+		soll = len(chalist)
 		for ist, cha in enumerate(chalist):
 			domain = cha['identifier']['value']
 			mycha = next((i for i in cha['challenges'] if i['type'] == 'dns-01'), None)
 
-			_progress(' + Writing DNS record', ist, soll, domain)
+			_progress(' + Writing DNS record', ist + 1, soll, domain)
 			name = "_acme-challenge.{0}".format(domain)
 			txt = acme_b64encode(hashlib.sha256(mycha['keyauth'].encode('ascii')).digest())
 			data = json.dumps({
@@ -466,6 +478,108 @@ class DNS01CloudflareChallenger():
 				time.sleep(1)
 		return okay
 
+	def dane_tlsa(self, certspath, fingerprints):
+		error = 0
+		cfgpath = os.path.join(certspath, 'dane-cloudflare.json')
+		if not 'dane' in self.config and not os.path.isfile(cfgpath):
+			return error
+
+		if not 'dane' in self.config:
+			self.config['dane'] = []
+
+		prevhash = fingerprints[0]
+		curhash = fingerprints[1]
+		nexthash = fingerprints[2]
+
+		danestor = {}
+		if os.path.isfile(cfgpath):
+			with open(cfgpath, 'r') as fp:
+				danestor = json.load(fp)
+
+		records_add = [] # (record, hash)
+		records_del = [] # (record, hash, cfid)
+
+		for record in self.config['dane']:
+			obj = danestor.get(record)
+			if obj:
+				# remove previous hash if any
+				if prevhash:
+					cfid = obj.get(prevhash)
+					if cfid:
+						records_del.append((record, prevhash, cfid))
+
+				# add current hash if not exists
+				cfid = obj.get(curhash)
+				if not cfid:
+					records_add.append((record, curhash))
+
+				# add next hash if not exists
+				cfid = obj.get(nexthash)
+				if not cfid:
+					records_add.append((record, nexthash))
+			else:
+				# add current and next hash
+				records_add.append((record, curhash))
+				records_add.append((record, nexthash))
+
+		for record, obj in danestor.items():
+			if record not in self.config['dane']:
+				# remove all records which have been removed from the config
+				for ahash, cfid in obj.items():
+					records_del.append((record, ahash, cfid))
+
+		if not (records_add or records_del):
+			return error
+		self.init()
+
+		if records_del:
+			logging.info('# Deleting {} DANE TLSA records.'.format(len(records_del)))
+			url = 'https://api.cloudflare.com/client/v4/zones/{0}/dns_records/'.format(self.zone)
+			soll = len(records_del)
+			for ist, record in enumerate(records_del):
+				_progress(' + Progress:', ist + 1, soll)
+				r = requests.request('DELETE', url + record[2], headers=self.headers)
+				if r.ok:
+					del danestor[record[0]][record[1]]
+					if not danestor[record[0]]:
+						del danestor[record[0]]
+				else:
+					logging.error(' ! Cloudflare API error while deleting record: ({0})\n{1}'.format(r.status_code, r.text))
+					error = 1
+
+		if records_add:
+			logging.info('# Adding {} DANE TLSA records.'.format(len(records_add)))
+			url = 'https://api.cloudflare.com/client/v4/zones/{0}/dns_records/'.format(self.zone)
+			soll = len(records_add)
+			for ist, record in enumerate(records_add):
+				_progress(' + Progress:', ist + 1, soll)
+				data = json.dumps({
+					"type": "TLSA",
+					"name": record[0],
+					"data": {
+						"usage": 3,
+						"selector": 1,
+						"matching_type": 1,
+						"certificate": record[1]
+					},
+					"ttl": 1
+				})
+				r = requests.post(url, data=data, headers=self.headers)
+				if r.ok:
+					cfid = r.json()['result']['id']
+					if record[0] in danestor:
+						danestor[record[0]][record[1]] = cfid
+					else:
+						danestor[record[0]] = {record[1]: cfid}
+				else:
+					logging.error(' ! Cloudflare API error while writing record: ({0})\n{1}'.format(r.status_code, r.text))
+					error = 2
+
+		with open(cfgpath, 'w') as fp:
+			json.dump(danestor, fp, sort_keys=True, indent=4)
+
+		return error
+
 	def clean(self):
 		logging.info('# Challenge cleanup.')
 		url = 'https://api.cloudflare.com/client/v4/zones/{0}/dns_records/'.format(self.zone)
@@ -476,6 +590,172 @@ class DNS01CloudflareChallenger():
 			if not r.ok:
 				logging.error(' ! Cloudflare API error while deleting record: ({0})\n{1}'.format(r.status_code, r.text))
 		self.needclean.clear()
+
+
+def privkey_manage(client, now, certspath, keypath, keypath_next, force):
+	privkey_prev = None
+	privkey = None
+	privkey_next = None
+	privkey_deploy_f = None
+	if os.path.isfile(keypath_next):
+		keyname = os.readlink(keypath)
+		keytime = int(keyname.lstrip('privkey-').rstrip('.pem'))
+		keyage = (now - keytime) / 3600 / 24
+		current_keypath = keypath
+
+		if keyage > KEY_ROTATE_DAYS or force:
+			logging.info('# Generating new next private key...')
+			privkey_next, pem = generate_key(client.algo, client.bits)
+			with open(os.open(os.path.join(certspath, 'privkey-{}.pem'.format(now)), os.O_WRONLY | os.O_CREAT, 0o600), 'wb') as fp:
+				fp.write(pem)
+
+			# load previously used key to remove it from DANE TLSA
+			privkey_prev = load_key(keypath)
+			current_keypath = keypath_next
+
+			# rotate keys: next -> current, new -> next
+			# but only rotate after the new certificate has been issued
+			def _rotate(keypath, keypath_next, keyname_next, keyname_new):
+				logging.info('# Rotating private key')
+				os.removef(keypath)
+				os.removef(keypath_next)
+				os.symlink(keyname_next, keypath)
+				os.symlink(keyname_new, keypath_next)
+			keyname_next = os.readlink(keypath_next)
+			keyname_new = 'privkey-{}.pem'.format(now)
+			privkey_deploy_f = lambda a=keypath, b=keypath_next, c=keyname_next, d=keyname_new: _rotate(a, b, c, d)
+		else:
+			# load next private key
+			privkey_next = load_key(keypath_next)
+
+		# load current private key
+		privkey = load_key(current_keypath)
+	else:
+		logging.info('# Generating initial private key...')
+		privkey, pem = generate_key(client.algo, client.bits)
+		with open(os.open(os.path.join(certspath, 'privkey-{}.pem'.format(now)), os.O_WRONLY | os.O_CREAT, 0o600), 'wb') as fp:
+			fp.write(pem)
+
+		# fake timestamp to avoid possibility of renewing both certificates on the same day
+		futurenow = now + (KEY_ROTATE_DAYS * 24 * 3600)
+		logging.info('# Generating next private key...')
+		privkey_next, pem = generate_key(client.algo, client.bits)
+		with open(os.open(os.path.join(certspath, 'privkey-{}.pem'.format(futurenow)), os.O_WRONLY | os.O_CREAT, 0o600), 'wb') as fp:
+			fp.write(pem)
+
+		# deploy key late in case of error
+		# otherwise we'd end up forcing key rotation because there is a key deployed without a certificate (thinking it was revoked)
+		def _deploy(keypath, keypath_next, keyname_cur, keyname_new):
+			os.removef(keypath)
+			os.removef(keypath_next)
+			os.symlink(keyname_cur, keypath)
+			os.symlink(keyname_new, keypath_next)
+		keyname_cur = 'privkey-{}.pem'.format(now)
+		keyname_new = 'privkey-{}.pem'.format(futurenow)
+		privkey_deploy_f = lambda a=keypath, b=keypath_next, c=keyname_cur, d=keyname_new: _deploy(a, b, c, d)
+
+	return privkey_prev, privkey, privkey_next, privkey_deploy_f
+
+def process_challenges(client, challenger, chatype, chalist):
+	logging.info('# Deploying challenge...')
+	if not challenger.deploy(chalist):
+		return 1
+
+	pending = []
+	logging.info('# Notifying ACME server...')
+	soll = len(chalist)
+	for ist, cha in enumerate(chalist):
+		domain = cha['identifier']['value']
+		mycha = next((i for i in cha['challenges'] if i['type'] == chatype), None)
+
+		_progress(' + Progress:', ist + 1, soll, domain)
+		res = client.acme_notify(mycha['url'], mycha['keyauth'])
+		if res['status'] == 'invalid':
+			_progress(' + Progress:', ist + 1, soll, domain, True)
+			logging.error(' ! received \'invalid\' status: %s', res)
+			return 1
+		elif res['status'] == 'pending':
+			pending.append(mycha)
+
+	logging.info('# Waiting for %d pending challenges...', len(pending))
+	tries, maxtries = 1, 15
+	stop = False
+	ist, soll = 0, len(pending)
+	while pending and not stop:
+		for mycha in pending[:]:
+			res = client.acme_check_challenge(mycha['url'])
+			if res['status'] == 'invalid':
+				_progress(' + Progress:', ist, soll, '[{0}/{1} tries]'.format(tries, maxtries), True)
+				logging.error(' ! received \'invalid\' status: %s', res)
+				stop = True
+				break
+			elif res['status'] != 'pending':
+				pending.remove(mycha)
+				ist += 1
+			_progress(' + Progress:', ist, soll, '[{0}/{1} tries]'.format(tries, maxtries))
+
+		if not pending or stop:
+			break
+		tries += 1
+		if tries > maxtries:
+			logging.error(' ! Maximum tries reached, aborting!')
+			stop = True
+			break
+		for x in range(0, tries):
+			_progress(' + Progress:', ist, soll, '[{0}/{1} tries] {2}s'.format(tries, maxtries, tries - x))
+			time.sleep(1)
+
+	if stop:
+		return 1
+
+	logging.info(' + Valid!')
+	return 0
+
+def revoke_certificates(client, config, revoke, revoke_all):
+	error = 0
+	paths = []
+	if revoke_all:
+		for name, obj in config['certificates'].items():
+			if 'disabled' in obj and obj['disabled']:
+				continue
+			paths.append(os.path.join('certs', name, 'cert.pem'))
+	else:
+		if revoke in config['certificates']:
+			paths.append(os.path.join('certs', revoke, 'cert.pem'))
+		else:
+			logging.error('! Invalid revoke parameter specified!')
+			return 1
+
+	for path in paths:
+		logging.info('# Revoking %s', path)
+		try:
+			with open(path, 'rb') as fd:
+				pem = fd.read()
+		except:
+			logging.error(' ! Couldn\'t open file!')
+			error = 1
+			continue
+
+		cert = x509.load_pem_x509_certificate(pem, default_backend())
+		try:
+			client.acme_revoke(cert.public_bytes(serialization.Encoding.DER))
+			logging.info(' + Success!')
+		except ValueError as e:
+			logging.error(' ! Error: {0}'.format(e))
+			error = 1
+			continue
+
+		os.remove(path)
+	return error
+
+def fingerprint_pkeys(pkeys):
+	# compute SHA256 hash of public key for DANE TLSA
+	fingerprints = [*[None] * len(pkeys)]
+	for i, pkey in enumerate(pkeys):
+		if pkey:
+			p = pkey.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+			fingerprints[i] = hashlib.sha256(p).hexdigest()
+	return fingerprints
 
 
 def main(args):
@@ -495,42 +775,9 @@ def main(args):
 	client = ACMEClient(ca_url=args.acme_server, email=args.email, algo=args.key_type)
 
 	if args.revoke or args.revoke_all:
-		paths = []
-		if args.revoke_all:
-			for name, obj in config['domains'].items():
-				if 'disabled' in obj and obj['disabled']:
-					continue
-				paths.append(os.path.join('certs', name, 'cert.pem'))
-		else:
-			if args.revoke in config['domains']:
-				paths.append(os.path.join('certs', args.revoke, 'cert.pem'))
-			else:
-				logging.error('! Invalid revoke parameter specified!')
-				return 1
+		return revoke_certificates(client, config, args.revoke, args.revoke_all)
 
-		for path in paths:
-			logging.info('# Revoking %s', path)
-			try:
-				with open(path, 'rb') as fd:
-					pem = fd.read()
-			except:
-				logging.error(' ! Couldn\'t open file!')
-				error = 1
-				continue
-
-			cert = x509.load_pem_x509_certificate(pem, default_backend())
-			try:
-				client.acme_revoke(cert.public_bytes(serialization.Encoding.DER))
-				logging.info(' + Success!')
-			except ValueError as e:
-				logging.error(' ! Error: {0}'.format(e))
-				error = 1
-				continue
-
-			os.remove(path)
-		return error
-
-	for name, obj in config['domains'].items():
+	for name, obj in config['certificates'].items():
 		if 'disabled' in obj and obj['disabled']:
 			continue
 
@@ -558,6 +805,7 @@ def main(args):
 			os.makedirs(certspath, mode=0o700)
 
 		keypath = os.path.abspath(os.path.join(certspath, 'privkey.pem'))
+		keypath_next = os.path.abspath(os.path.join(certspath, 'privkey-next.pem'))
 		csrpath = os.path.abspath(os.path.join(certspath, 'cert.csr'))
 		fullchainpath = os.path.abspath(os.path.join(certspath, 'fullchain.pem'))
 		certpath = os.path.abspath(os.path.join(certspath, 'cert.pem'))
@@ -583,8 +831,8 @@ def main(args):
 
 			timeleft = cert.not_valid_after - datetime.datetime.now()
 			logging.info(' + Certificate expires on: %s (%d days)', cert.not_valid_after, timeleft.days)
-			if timeleft.days < RENEW_DAYS:
-				logging.info('  * Less than %d days!', RENEW_DAYS)
+			if timeleft.days < RENEW_DAYS_MIN:
+				logging.info('  * Less than %d days!', RENEW_DAYS_MIN)
 				if not renew:
 					logging.info('  * Renewing!')
 					renew = True
@@ -592,9 +840,6 @@ def main(args):
 			if not renew and (args.force or name == args.force_one):
 				logging.info(' + Forcing renew!')
 				renew = True
-
-		if cert and not renew:
-			continue
 
 		challenger = None
 		try:
@@ -605,6 +850,17 @@ def main(args):
 		except ValueError as e:
 			logging.error('! Challenger error: {0}'.format(e))
 			error = 1
+			continue
+
+		if cert and not renew:
+			if hasattr(challenger, 'dane_tlsa'):
+				# load private keys
+				privkey = load_key(keypath)
+				privkey_next = load_key(keypath_next)
+				# calculate fingerprints
+				fingerprints = fingerprint_pkeys([None, privkey, privkey_next])
+				# call DANE TLSA handler
+				challenger.dane_tlsa(certspath, fingerprints)
 			continue
 
 		logging.info('# Creating new order...')
@@ -620,74 +876,20 @@ def main(args):
 			chalist.append(client.acme_get_challenge(url))
 
 		try:
-			logging.info('# Deploying challenge...')
-			if not challenger.deploy(chalist):
-				challenger.clean()
+			if process_challenges(client, challenger, chatype, chalist):
 				error = 1
 				continue
-
-			pending = []
-			logging.info('# Notifying ACME server...')
-			soll = len(chalist)
-			for ist, cha in enumerate(chalist):
-				domain = cha['identifier']['value']
-				mycha = next((i for i in cha['challenges'] if i['type'] == chatype), None)
-
-				_progress(' + Progress:', ist + 1, soll, domain)
-				res = client.acme_notify(mycha['url'], mycha['keyauth'])
-				if res['status'] == 'invalid':
-					_progress(' + Progress:', ist + 1, soll, domain, True)
-					logging.error(' ! received \'invalid\' status: %s', res)
-					challenger.clean()
-					error = 1
-					continue
-				elif res['status'] == 'pending':
-					pending.append(mycha)
-
-			logging.info('# Waiting for %d pending challenges...', len(pending))
-			tries, maxtries = 1, 15
-			stop = False
-			ist, soll = 0, len(pending)
-			while pending and not stop:
-				for mycha in pending[:]:
-					res = client.acme_check_challenge(mycha['url'])
-					if res['status'] == 'invalid':
-						_progress(' + Progress:', ist, soll, '[{0}/{1} tries]'.format(tries, maxtries), True)
-						logging.error(' ! received \'invalid\' status: %s', res)
-						stop = True
-						break
-					elif res['status'] != 'pending':
-						pending.remove(mycha)
-						ist += 1
-					_progress(' + Progress:', ist, soll, '[{0}/{1} tries]'.format(tries, maxtries))
-
-				if not pending or stop:
-					break
-				tries += 1
-				if tries > maxtries:
-					logging.error(' ! Maximum tries reached, aborting!')
-					stop = True
-					break
-				for x in range(0, tries):
-					_progress(' + Progress:', ist, soll, '[{0}/{1} tries] {2}s'.format(tries, maxtries, tries - x))
-					time.sleep(1)
-
-			if stop:
-				challenger.clean()
-				error = 1
-				continue
-
-			logging.info(' + Valid!')
 		except KeyboardInterrupt:
 			return 1
 		finally:
 			challenger.clean()
 
 		now = int(time.time())
-		logging.info('# Generating private key...')
-		privkey, pem = generate_key(client.algo, client.bits)
-		with open(os.open(os.path.join(certspath, 'privkey-{}.pem'.format(now)), os.O_WRONLY | os.O_CREAT, 0o600), 'wb') as fp:
-			fp.write(pem)
+		force_key = args.force_key or not cert # force key rotation if certifcate was revoked(deleted)
+		privkey_prev, \
+		privkey, \
+		privkey_next, \
+		privkey_deploy_f = privkey_manage(client, now, certspath, keypath, keypath_next, force_key)
 
 		logging.info('# Generating certificate signing request...')
 		csr = x509.CertificateSigningRequestBuilder().subject_name(
@@ -723,13 +925,19 @@ def main(args):
 		with open(os.path.join(certspath, 'chain-{}.pem'.format(now)), 'wb') as fp:
 			fp.write(b'\n'.join(pem_parts[1:]))
 
-		os.removef(keypath)
+		fingerprints = fingerprint_pkeys([privkey_prev, privkey, privkey_next])
+
+		if hasattr(challenger, 'dane_tlsa'):
+			challenger.dane_tlsa(certspath, fingerprints)
+
+		if privkey_deploy_f:
+			privkey_deploy_f()
+
 		os.removef(csrpath)
 		os.removef(fullchainpath)
 		os.removef(certpath)
 		os.removef(chainpath)
 
-		os.symlink('privkey-{}.pem'.format(now), keypath)
 		os.symlink('cert-{}.csr'.format(now), csrpath)
 		os.symlink('fullchain-{}.pem'.format(now), fullchainpath)
 		os.symlink('cert-{}.pem'.format(now), certpath)
@@ -771,6 +979,7 @@ if __name__ == "__main__":
 	parser.add_argument('-c', '--config', default=None, help='config file in JSON or YAML (.yaml or .yml) format')
 	parser.add_argument('-f', '--force', action='store_true', help='force renew all certificates')
 	parser.add_argument('-fo', '--force-one', metavar='name', help='force renew one certificate')
+	parser.add_argument('-fk', '--force-key', action='store_true', help='force private key rotation when renewing certificates')
 	parser.add_argument('-r', '--revoke', metavar='name', help='revoke one certificate')
 	parser.add_argument('-ra', '--revoke-all', action='store_true', help='revoke all certificates')
 	parser.add_argument('-t', '--key-type', default='ec-384', metavar='type',

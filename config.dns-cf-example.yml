@@ -1,4 +1,4 @@
-domains:
+certificates:
   example.com:
     domains:
       - example.com
@@ -8,6 +8,8 @@ domains:
       # name: example.com # if the domains list only has subdomains
       email: "admin@example.com"
       key: "api-key-here"
+      dane:
+        - dane1
     copy:
       privkey: /etc/ssl/private/{name}.key
       fullchain: /etc/ssl/private/{name}.pem
