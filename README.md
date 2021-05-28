@@ -147,7 +147,8 @@ WantedBy=timers.target
 Description=Run snacme cronjob
 
 [Service]
-Type=oneshot
+Type=simple
+Restart=on-failure
 User=root
 WorkingDirectory=/root/snacme
 ExecStart=/root/snacme/snacme.py
