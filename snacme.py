@@ -203,7 +203,7 @@ class ACMEClient():
 		return resp
 
 	def acme_get_challenge(self, url):
-		r = self.api_post(url, None) # POST-as-GET
+		r = self.api_post(url, '') # POST-as-GET
 		if not r.ok:
 			raise ValueError('ACME error while getting challenge: ({0})\n{1}'.format(r.status_code, r.text))
 
@@ -225,7 +225,7 @@ class ACMEClient():
 		return r.json()
 
 	def acme_check_challenge(self, url):
-		r = self.api_post(url, None) # POST-as-GET
+		r = self.api_post(url, '') # POST-as-GET
 		if not r.ok:
 			raise ValueError('ACME error while checking challenge: ({0})\n{1}'.format(r.status_code, r.text))
 		return r.json()
@@ -240,7 +240,7 @@ class ACMEClient():
 		return r.json()
 
 	def acme_download_cert(self, url):
-		r = self.api_post(url, None) # POST-as-GET
+		r = self.api_post(url, '') # POST-as-GET
 		if not r.ok:
 			raise ValueError('ACME error while downloading certificate: ({0})\n{1}'.format(r.status_code, r.text))
 		return r
@@ -343,7 +343,17 @@ class ACMEClient():
 	def api_post(self, url, payload):
 		headers = {'Content-Type': 'application/jose+json'}
 		data = self.jws_sign(url, payload)
-		return self._requests_request('POST', url, data, headers)
+		res = self._requests_request('POST', url, data, headers)
+		retry = (res.headers.get('Retry-After'), res.headers.get('Location'))
+		while retry[0] is not None and retry[1] is not None:
+			wait = min(int(retry[0]), 30)
+			for x in range(0, wait):
+				_progress(' + Waiting...', x + 1, wait)
+				time.sleep(1)
+			data_ = self.jws_sign(retry[1], '')
+			res = self._requests_request('POST', retry[1], data_, headers) # POST-as-GET
+			retry = (res.headers.get('Retry-After'), res.headers.get('Location'))
+		return res
 
 
 class HTTP01Challenger():
@@ -674,7 +684,7 @@ def process_challenges(client, challenger, chatype, chalist):
 			_progress(' + Progress:', ist + 1, soll, domain, True)
 			logging.error(' ! received \'invalid\' status: %s', res)
 			return 1
-		elif res['status'] == 'pending':
+		elif res['status'] != 'valid':
 			pending.append(mycha)
 
 	logging.info('# Waiting for %d pending challenges...', len(pending))
@@ -689,7 +699,7 @@ def process_challenges(client, challenger, chatype, chalist):
 				logging.error(' ! received \'invalid\' status: %s', res)
 				stop = True
 				break
-			elif res['status'] != 'pending':
+			elif res['status'] == 'valid':
 				pending.remove(mycha)
 				ist += 1
 			_progress(' + Progress:', ist, soll, '[{0}/{1} tries]'.format(tries, maxtries))
@@ -758,18 +768,7 @@ def fingerprint_pkeys(pkeys):
 	return fingerprints
 
 
-def main(args):
-	with open(args.config, 'r') as fp:
-		if args.config.endswith('.yaml') or args.config.endswith('.yml'):
-			if yaml is None:
-				raise ValueError('YAML config specified but python-yaml not installed!')
-			try:
-				config = yaml.full_load(fp)
-			except AttributeError:
-				config = yaml.load(fp)
-		else:
-			config = json.load(fp)
-
+def main(args, config):
 	error = 0
 	issued = 0
 	client = ACMEClient(ca_url=args.acme_server, email=args.email, algo=args.key_type)
@@ -873,7 +872,9 @@ def main(args):
 		for ist, url in enumerate(order['authorizations']):
 			domain = order['identifiers'][ist]['value']
 			_progress(' + Progress:', ist + 1, soll, domain)
-			chalist.append(client.acme_get_challenge(url))
+			chal = client.acme_get_challenge(url)
+			if chal['status'] != 'valid': # skip pre-authorized
+				chalist.append(chal)
 
 		try:
 			if process_challenges(client, challenger, chatype, chalist):
@@ -1020,14 +1021,27 @@ if __name__ == "__main__":
 	if args.staging:
 		ACME_SERVER = LE_STAGING_ACME_SERVER
 
-	if args.acme_server is None:
-		args.acme_server = ACME_SERVER
+	with open(args.config, 'r') as fp:
+		if args.config.endswith('.yaml') or args.config.endswith('.yml'):
+			if yaml is None:
+				raise ValueError('YAML config specified but python-yaml not installed!')
+			try:
+				config = yaml.full_load(fp)
+			except AttributeError:
+				config = yaml.load(fp)
+		else:
+			config = json.load(fp)
 
-	url = 'https://' + args.acme_server.split("://")[-1]
-	o = urllib.parse.urlparse(url)
+	if args.acme_server is None:
+		args.acme_server = config.get('acme_server', ACME_SERVER)
+
+	o = urllib.parse.urlparse(args.acme_server)
+	if not o.scheme:
+		o.scheme = 'https'
 	path = o.path.rsplit('/directory')[0]
 	args.acme_server = urllib.parse.urlunsplit((o.scheme, o.netloc, path, '', ''))
 
-	ret = main(args)
+	ret = main(args, config)
 	if ret != 0:
 		sys.exit(ret)
+

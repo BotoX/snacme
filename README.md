@@ -126,6 +126,8 @@ alldone:
   - systemctl restart vsftpd
 ```
 
+Custom ACME server URI can be specified in the root of the config: `acme_server: 'uri'`
+
 
 ### systemd example
 `/etc/systemd/system/snacme.timer`
