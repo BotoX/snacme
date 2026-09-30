@@ -42,10 +42,12 @@ KEY_ROTATE_DAYS = 30
 CA_CERT = None
 SUPPORTED_CRYPTO = {
 	'rsa-2048': ('rsa', 2048),
+	'rsa-3072': ('rsa', 3072),
 	'rsa-4096': ('rsa', 4096),
 	'ec-256': ('ec', 256),
 	'ec-384': ('ec', 384)
 }
+DEFAULT_KEY_TYPES = ['ec-384']
 
 def _progress(prefix, val, end, postfix='', abort=False):
 	sys.stderr.write(' ' * _progress.lastlen + '\r')
@@ -68,6 +70,12 @@ def __os_removef(*args, **kwargs):
 	with contextlib.suppress(FileNotFoundError):
 		os.remove(*args, **kwargs)
 os.removef = __os_removef
+
+def atomic_symlink(target, link_name):
+	tmp_link = link_name + '.tmp'
+	os.removef(tmp_link)
+	os.symlink(target, tmp_link)
+	os.replace(tmp_link, link_name)
 
 def generate_key(algo, bits):
 	if algo == 'rsa':
@@ -155,6 +163,27 @@ class ACMEClient():
 			logging.info('# Using existing account: %s', reginfo)
 			with open(reginfo, 'r') as fp:
 				account = json.load(fp)
+			self.kid = account['kid']
+
+			if self.email:
+				have_contacts = account.get('contact', [])
+				want_contact = 'mailto:' + self.email
+				if want_contact not in have_contacts:
+					logging.info('# Updating account contact information from %s to %s', have_contacts, [want_contact])
+					req = {'contact': [want_contact]}
+
+					r = self.api_post(self.kid, json.dumps(req))
+					if 'Location' in r.headers:
+						self.kid = r.headers['Location']
+					if r.ok:
+						account = r.json()
+						account['kid'] = self.kid
+						account['contact'] = [want_contact]
+						with open(reginfo, 'w') as fp:
+							json.dump(account, fp)
+						logging.info(' + Success!')
+					else:
+						logging.error('! Failed to update contact info: %s', r.text)
 		else:
 			logging.info('# Registering new account on %s', self.ca_url)
 
@@ -165,6 +194,8 @@ class ACMEClient():
 				req['contact'] = ['mailto:' + self.email]
 
 			r = self.api_post(self.directory['newAccount'], json.dumps(req))
+			if 'Location' in r.headers:
+				self.kid = r.headers['Location']
 			if not r.ok:
 				abort = True
 				if r.status_code == 409 and r.headers['Content-Type'] == 'application/problem+json':
@@ -179,12 +210,13 @@ class ACMEClient():
 					raise ValueError('ACME error while registering account: ({0})\n{1}'.format(r.status_code, r.text))
 
 			account = r.json()
-			account['kid'] = r.headers['Location']
+			account['kid'] = self.kid
 			with open(reginfo, 'w') as fp:
 				json.dump(account, fp)
-			logging.info(' + Success!')
-
-		self.kid = account['kid']
+			if r.status_code == 200:
+				logging.info(' + Found.')
+			else:
+				logging.info(' + Success!')
 
 	def acme_order(self, domains):
 		req = {
@@ -252,6 +284,30 @@ class ACMEClient():
 		r = self.api_post(self.directory['revokeCert'], json.dumps(req))
 		if not r.ok:
 			raise ValueError('ACME error while revoking certificate: ({0})\n{1}'.format(r.status_code, r.text))
+
+	def acme_renewal_info(self, cert):
+		if 'renewalInfo' not in self.directory:
+			return None
+
+		aki_ext = cert.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_KEY_IDENTIFIER)
+		aki_key_id = aki_ext.value.key_identifier
+		if aki_key_id is None:
+			logging.error(" ! Certificate missing AKI key identifier; cannot use ARI.")
+			return None
+
+		serial_bytes = int_to_bytes(cert.serial_number)
+		if serial_bytes[0] & 0x80: # If high bit set, prepend 0x00 for DER positivity
+			serial_bytes = b'\x00' + serial_bytes
+
+		aki_b64 = acme_b64encode(aki_key_id)
+		serial_b64 = acme_b64encode(serial_bytes)
+		ari_id = "{}.{}".format(aki_b64, serial_b64)
+
+		url = "{}/{}".format(self.directory['renewalInfo'], ari_id)
+		r = self.api_get(url)
+		if not r.ok:
+			raise ValueError('ACME error while getting renewal information (ARI): ({0})\n{1}'.format(r.status_code, r.text))
+		return r.json()
 
 	def crypto_sign_msg(self, msg):
 		if self.algo == 'rsa':
@@ -346,7 +402,7 @@ class ACMEClient():
 		res = self._requests_request('POST', url, data, headers)
 		retry = (res.headers.get('Retry-After'), res.headers.get('Location'))
 		while retry[0] is not None and retry[1] is not None:
-			wait = min(int(retry[0]), 30)
+			wait = min(int(retry[0]), 5)
 			for x in range(0, wait):
 				_progress(' + Waiting...', x + 1, wait)
 				time.sleep(1)
@@ -627,10 +683,8 @@ def privkey_manage(client, now, certspath, keypath, keypath_next, force):
 			# but only rotate after the new certificate has been issued
 			def _rotate(keypath, keypath_next, keyname_next, keyname_new):
 				logging.info('# Rotating private key')
-				os.removef(keypath)
-				os.removef(keypath_next)
-				os.symlink(keyname_next, keypath)
-				os.symlink(keyname_new, keypath_next)
+				atomic_symlink(keyname_next, keypath)
+				atomic_symlink(keyname_new, keypath_next)
 			keyname_next = os.readlink(keypath_next)
 			keyname_new = 'privkey-{}.pem'.format(now)
 			privkey_deploy_f = lambda a=keypath, b=keypath_next, c=keyname_next, d=keyname_new: _rotate(a, b, c, d)
@@ -658,8 +712,8 @@ def privkey_manage(client, now, certspath, keypath, keypath_next, force):
 		def _deploy(keypath, keypath_next, keyname_cur, keyname_new):
 			os.removef(keypath)
 			os.removef(keypath_next)
-			os.symlink(keyname_cur, keypath)
-			os.symlink(keyname_new, keypath_next)
+			atomic_symlink(keyname_cur, keypath)
+			atomic_symlink(keyname_new, keypath_next)
 		keyname_cur = 'privkey-{}.pem'.format(now)
 		keyname_new = 'privkey-{}.pem'.format(futurenow)
 		privkey_deploy_f = lambda a=keypath, b=keypath_next, c=keyname_cur, d=keyname_new: _deploy(a, b, c, d)
@@ -721,23 +775,30 @@ def process_challenges(client, challenger, chatype, chalist):
 	logging.info(' + Valid!')
 	return 0
 
-def revoke_certificates(client, config, revoke, revoke_all):
+def revoke_certificates(args, config, get_client):
 	error = 0
 	paths = []
-	if revoke_all:
+	if args.revoke_all:
 		for name, obj in config['certificates'].items():
 			if 'disabled' in obj and obj['disabled']:
 				continue
-			paths.append(os.path.join('certs', name, 'cert.pem'))
+			for kt in _itery(obj.get('type', args.key_types)):
+				paths.append((kt, os.path.join('certs', name, kt, 'cert.pem')))
 	else:
-		if revoke in config['certificates']:
-			paths.append(os.path.join('certs', revoke, 'cert.pem'))
+		name = args.revoke
+		if name in config['certificates']:
+			obj = config['certificates'][name]
+			for kt in _itery(obj.get('type', args.key_types)):
+				paths.append((kt, os.path.join('certs', name, kt, 'cert.pem')))
 		else:
 			logging.error('! Invalid revoke parameter specified!')
 			return 1
 
-	for path in paths:
+	for kt, path in paths:
+		if not os.path.isfile(path):
+			continue
 		logging.info('# Revoking %s', path)
+		client = get_client(kt)
 		try:
 			with open(path, 'rb') as fd:
 				pem = fd.read()
@@ -767,16 +828,40 @@ def fingerprint_pkeys(pkeys):
 			fingerprints[i] = hashlib.sha256(p).hexdigest()
 	return fingerprints
 
+def migrate_certspath(name):
+	# Migration: Move old certs/name/* to certs/name/key-type/*
+	certspath_old = os.path.join('certs', name)
+	if os.path.isfile(os.path.join(certspath_old, 'privkey.pem')):
+		privkey = load_key(os.path.join(certspath_old, 'privkey.pem'))
+		if isinstance(privkey, rsa.RSAPrivateKey):
+			key_type = 'rsa-{}'.format(privkey.key_size)
+		elif isinstance(privkey, ec.EllipticCurvePrivateKey):
+			key_type = 'ec-{}'.format(privkey.curve.key_size)
+
+		if key_type in SUPPORTED_CRYPTO:
+			certspath_new = os.path.join(certspath_old, key_type)
+			logging.info('! Migrating \'%s\' [%s] from "%s" to "%s"', name, key_type, certspath_old, certspath_new)
+			os.makedirs(certspath_new, mode=0o700, exist_ok=True)
+			for f in os.listdir(certspath_old):
+				if f != key_type:
+					shutil.move(os.path.join(certspath_old, f), os.path.join(certspath_new, f))
 
 def main(args, config):
 	error = 0
 	issued = 0
-	client = ACMEClient(ca_url=args.acme_server, email=args.email, algo=args.key_type)
+
+	clients = {}
+	def get_client(algo):
+		if algo not in clients:
+			clients[algo] = ACMEClient(ca_url=args.acme_server, email=args.email, algo=algo)
+		return clients[algo]
 
 	if args.revoke or args.revoke_all:
-		return revoke_certificates(client, config, args.revoke, args.revoke_all)
+		return revoke_certificates(args, config, get_client)
 
 	for name, obj in config['certificates'].items():
+		migrate_certspath(name)
+
 		if 'disabled' in obj and obj['disabled']:
 			continue
 
@@ -796,173 +881,192 @@ def main(args, config):
 			error = 1
 			continue
 
-		logging.info('# Processing \'%s\' with %d domain name(s) using %s challenge', name, len(domains), chatype)
-		logging.info(' * %s', ' '.join(domains))
+		key_types = _itery(obj.get('type', args.key_types))
+		for key_type in key_types:
+			if key_type not in SUPPORTED_CRYPTO:
+				logging.error('! Unsupported key type %s requested for %s', key_type, name)
+				error = 1
+				continue
 
-		certspath = os.path.join('certs', name)
-		if not os.path.isdir(certspath):
-			os.makedirs(certspath, mode=0o700)
+			client = get_client(key_type)
 
-		keypath = os.path.abspath(os.path.join(certspath, 'privkey.pem'))
-		keypath_next = os.path.abspath(os.path.join(certspath, 'privkey-next.pem'))
-		csrpath = os.path.abspath(os.path.join(certspath, 'cert.csr'))
-		fullchainpath = os.path.abspath(os.path.join(certspath, 'fullchain.pem'))
-		certpath = os.path.abspath(os.path.join(certspath, 'cert.pem'))
-		chainpath = os.path.abspath(os.path.join(certspath, 'chain.pem'))
+			logging.info('\n# Processing \'%s\' [%s] with %d domain name(s) using %s challenge', name, key_type, len(domains), chatype)
+			logging.info(' * %s', ' '.join(domains))
 
-		cert = None
-		try:
-			with open(certpath, 'rb') as fd:
-				cert = x509.load_pem_x509_certificate(fd.read(), default_backend())
-		except Exception:
-			pass
+			certspath = os.path.join('certs', name, key_type)
+			if not os.path.isdir(certspath):
+				os.makedirs(certspath, mode=0o700)
 
-		renew = False
-		if cert:
-			logging.info('# Found existing certificate:')
-			olddomains = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME) \
-						 .value.get_values_for_type(x509.DNSName)
-			changed = sorted(domains) != sorted(olddomains)
-			logging.info(' + Domain name(s) of certificate: %s', 'changed!' if changed else 'unchanged.')
-			if changed and not renew:
-				logging.info('  * Renewing!')
-				renew = True
+			keypath = os.path.abspath(os.path.join(certspath, 'privkey.pem'))
+			keypath_next = os.path.abspath(os.path.join(certspath, 'privkey-next.pem'))
+			csrpath = os.path.abspath(os.path.join(certspath, 'cert.csr'))
+			fullchainpath = os.path.abspath(os.path.join(certspath, 'fullchain.pem'))
+			certpath = os.path.abspath(os.path.join(certspath, 'cert.pem'))
+			chainpath = os.path.abspath(os.path.join(certspath, 'chain.pem'))
 
-			timeleft = cert.not_valid_after - datetime.datetime.now()
-			logging.info(' + Certificate expires on: %s (%d days)', cert.not_valid_after, timeleft.days)
-			if timeleft.days < RENEW_DAYS_MIN:
-				logging.info('  * Less than %d days!', RENEW_DAYS_MIN)
-				if not renew:
+			cert = None
+			try:
+				with open(certpath, 'rb') as fd:
+					cert = x509.load_pem_x509_certificate(fd.read(), default_backend())
+			except Exception:
+				pass
+
+			renew = False
+			if cert:
+				logging.info('# Found existing certificate:')
+				olddomains = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME) \
+							.value.get_values_for_type(x509.DNSName)
+				changed = sorted(domains) != sorted(olddomains)
+				logging.info(' + Domain name(s) of certificate: %s', 'changed!' if changed else 'unchanged.')
+				if changed and not renew:
 					logging.info('  * Renewing!')
 					renew = True
 
-			if not renew and (args.force or name == args.force_one):
-				logging.info(' + Forcing renew!')
-				renew = True
+				now_utc = datetime.datetime.now(datetime.timezone.utc)
+				ari_info = client.acme_renewal_info(cert)
+				if ari_info:
+					start = datetime.datetime.fromisoformat(ari_info['suggestedWindow']['start'].replace('Z', '+00:00'))
+					end = datetime.datetime.fromisoformat(ari_info['suggestedWindow']['end'].replace('Z', '+00:00'))
 
-		challenger = None
-		try:
-			if chatype == 'http-01':
-				challenger = HTTP01Challenger(chaconf, domains)
-			elif chatype == 'dns-01':
-				challenger = DNS01CloudflareChallenger(chaconf, domains)
-		except ValueError as e:
-			logging.error('! Challenger error: {0}'.format(e))
-			error = 1
-			continue
+					if now_utc >= start:
+						logging.info(' + ARI window reached/passed: from %s to %s', start, end)
+						if not renew:
+							logging.info('  * Renewing!')
+							renew = True
+					else:
+						time_to_window = start - now_utc
+						logging.info(' + ARI suggested window starts on: %s (%d days)', start, time_to_window.days)
+				else:
+					timeleft = cert.not_valid_after_utc - now_utc
+					logging.info(' + Certificate expires on: %s (%d days)', cert.not_valid_after_utc, timeleft.days)
+					if timeleft.days < RENEW_DAYS_MIN:
+						logging.info('  * Less than %d days!', RENEW_DAYS_MIN)
+						if not renew:
+							logging.info('  * Renewing!')
+							renew = True
 
-		if cert and not renew:
-			if hasattr(challenger, 'dane_tlsa'):
-				# load private keys
-				privkey = load_key(keypath)
-				privkey_next = load_key(keypath_next)
-				# calculate fingerprints
-				fingerprints = fingerprint_pkeys([None, privkey, privkey_next])
-				# call DANE TLSA handler
-				challenger.dane_tlsa(certspath, fingerprints)
-			continue
+				if not renew and (args.force or name == args.force_one):
+					logging.info(' + Forcing renew!')
+					renew = True
 
-		logging.info('# Creating new order...')
-		order = client.acme_order(domains)
-		logging.info(' + Success!')
-
-		logging.info('# Requesting challenges...')
-		chalist = []
-		soll = len(domains)
-		for ist, url in enumerate(order['authorizations']):
-			domain = order['identifiers'][ist]['value']
-			_progress(' + Progress:', ist + 1, soll, domain)
-			chal = client.acme_get_challenge(url)
-			if chal['status'] != 'valid': # skip pre-authorized
-				chalist.append(chal)
-
-		try:
-			if process_challenges(client, challenger, chatype, chalist):
+			challenger = None
+			try:
+				if chatype == 'http-01':
+					challenger = HTTP01Challenger(chaconf, domains)
+				elif chatype == 'dns-01':
+					challenger = DNS01CloudflareChallenger(chaconf, domains)
+			except ValueError as e:
+				logging.error('! Challenger error: {0}'.format(e))
 				error = 1
 				continue
-		except KeyboardInterrupt:
-			return 1
-		finally:
-			challenger.clean()
 
-		now = int(time.time())
-		force_key = args.force_key or not cert # force key rotation if certifcate was revoked(deleted)
-		privkey_prev, \
-		privkey, \
-		privkey_next, \
-		privkey_deploy_f = privkey_manage(client, now, certspath, keypath, keypath_next, force_key)
+			if cert and not renew:
+				if hasattr(challenger, 'dane_tlsa'):
+					# load private keys
+					privkey = load_key(keypath)
+					privkey_next = load_key(keypath_next)
+					# calculate fingerprints
+					fingerprints = fingerprint_pkeys([None, privkey, privkey_next])
+					# call DANE TLSA handler
+					challenger.dane_tlsa(certspath, fingerprints)
+				continue
 
-		logging.info('# Generating certificate signing request...')
-		csr = x509.CertificateSigningRequestBuilder().subject_name(
-			x509.Name([
-				x509.NameAttribute(NameOID.COMMON_NAME, domains[0]),
-		])).add_extension(
-			x509.SubjectAlternativeName([
-				x509.DNSName(x) for x in domains
-			]),
-			critical=False
-		)
-		csr = csr.sign(privkey, hashes.SHA256(), default_backend())
-		with open(os.path.join(certspath, 'cert-{}.csr'.format(now)), 'wb') as fp:
-			fp.write(csr.public_bytes(serialization.Encoding.PEM))
+			logging.info('# Creating new order...')
+			order = client.acme_order(domains)
+			logging.info(' + Success!')
 
-		logging.info('# Finalizing order...')
-		order = client.acme_finalize(order['finalize'], csr.public_bytes(serialization.Encoding.DER))
-		logging.info(' + Success!')
+			logging.info('# Requesting challenges...')
+			chalist = []
+			soll = len(domains)
+			for ist, url in enumerate(order['authorizations']):
+				domain = order['identifiers'][ist]['value']
+				_progress(' + Progress:', ist + 1, soll, domain)
+				chal = client.acme_get_challenge(url)
+				if chal['status'] != 'valid': # skip pre-authorized
+					chalist.append(chal)
 
-		logging.info('# Downloading signed certificate...')
-		pem = client.acme_download_cert(order['certificate']).content
-		logging.info(' + Success!')
+			try:
+				if process_challenges(client, challenger, chatype, chalist):
+					error = 1
+					continue
+			except KeyboardInterrupt:
+				return 1
+			finally:
+				challenger.clean()
 
-		with open(os.path.join(certspath, 'fullchain-{}.pem'.format(now)), 'wb') as fp:
-			fp.write(pem)
+			now = int(time.time())
+			force_key = args.force_key or not cert # force key rotation if certificate was revoked(deleted)
+			privkey_prev, \
+			privkey, \
+			privkey_next, \
+			privkey_deploy_f = privkey_manage(client, now, certspath, keypath, keypath_next, force_key)
 
-		# Generate cert.pem and chain.pem from fullchain.pem
-		pem_parts = re.findall(b'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----\n', pem, re.DOTALL)
+			logging.info('# Generating certificate signing request...')
+			csr = x509.CertificateSigningRequestBuilder().subject_name(
+				x509.Name([
+					x509.NameAttribute(NameOID.COMMON_NAME, domains[0]),
+			])).add_extension(
+				x509.SubjectAlternativeName([
+					x509.DNSName(x) for x in domains
+				]),
+				critical=False
+			)
+			csr = csr.sign(privkey, hashes.SHA256(), default_backend())
+			with open(os.path.join(certspath, 'cert-{}.csr'.format(now)), 'wb') as fp:
+				fp.write(csr.public_bytes(serialization.Encoding.PEM))
 
-		with open(os.path.join(certspath, 'cert-{}.pem'.format(now)), 'wb') as fp:
-			fp.write(pem_parts[0])
+			logging.info('# Finalizing order...')
+			order = client.acme_finalize(order['finalize'], csr.public_bytes(serialization.Encoding.DER))
+			logging.info(' + Success!')
 
-		with open(os.path.join(certspath, 'chain-{}.pem'.format(now)), 'wb') as fp:
-			fp.write(b'\n'.join(pem_parts[1:]))
+			logging.info('# Downloading signed certificate...')
+			pem = client.acme_download_cert(order['certificate']).content
+			logging.info(' + Success!')
 
-		fingerprints = fingerprint_pkeys([privkey_prev, privkey, privkey_next])
+			with open(os.path.join(certspath, 'fullchain-{}.pem'.format(now)), 'wb') as fp:
+				fp.write(pem)
 
-		if hasattr(challenger, 'dane_tlsa'):
-			challenger.dane_tlsa(certspath, fingerprints)
+			# Generate cert.pem and chain.pem from fullchain.pem
+			pem_parts = re.findall(b'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', pem, re.DOTALL)
 
-		if privkey_deploy_f:
-			privkey_deploy_f()
+			with open(os.path.join(certspath, 'cert-{}.pem'.format(now)), 'wb') as fp:
+				fp.write(pem_parts[0] + b'\n')
 
-		os.removef(csrpath)
-		os.removef(fullchainpath)
-		os.removef(certpath)
-		os.removef(chainpath)
+			with open(os.path.join(certspath, 'chain-{}.pem'.format(now)), 'wb') as fp:
+				fp.write(b'\n'.join(pem_parts[1:]) + b'\n')
 
-		os.symlink('cert-{}.csr'.format(now), csrpath)
-		os.symlink('fullchain-{}.pem'.format(now), fullchainpath)
-		os.symlink('cert-{}.pem'.format(now), certpath)
-		os.symlink('chain-{}.pem'.format(now), chainpath)
-		issued += 1
+			fingerprints = fingerprint_pkeys([privkey_prev, privkey, privkey_next])
 
-		copy = obj.get('copy', None)
-		if copy:
-			for key, path in [('privkey', keypath), ('fullchain', fullchainpath), ('cert', certpath), ('chain', chainpath)]:
-				for target in _itery(copy.get(key, None)):
-					target = target.replace('{name}', name)
-					logging.info('# Copying {} key to: {}'.format(key, target))
-					shutil.copy2(path, target)
+			if hasattr(challenger, 'dane_tlsa'):
+				challenger.dane_tlsa(certspath, fingerprints)
 
-		for cmd in _itery(obj.get('deploy', None)):
-			cmd = cmd.replace('{name}', name) \
-					.replace('{privkey}', keypath).replace('{fullchain}', fullchainpath) \
-					.replace('{cert}', certpath).replace('{chain}', chainpath)
-			logging.info('# Running deploy script: %s', cmd)
-			r = subprocess.run(cmd, shell=True)
-			if r.returncode != 0:
-				logging.info(' ! Returned with non-zero returncode: %s', r.returncode)
-				error = 1
-		logging.info('----- ----- -----')
+			if privkey_deploy_f:
+				privkey_deploy_f()
+
+			atomic_symlink('cert-{}.csr'.format(now), csrpath)
+			atomic_symlink('fullchain-{}.pem'.format(now), fullchainpath)
+			atomic_symlink('cert-{}.pem'.format(now), certpath)
+			atomic_symlink('chain-{}.pem'.format(now), chainpath)
+			issued += 1
+
+			copy = obj.get('copy', None)
+			if copy:
+				for key, path in [('privkey', keypath), ('fullchain', fullchainpath), ('cert', certpath), ('chain', chainpath)]:
+					for target in _itery(copy.get(key, None)):
+						target = target.replace('{name}', name).replace('{type}', key_type)
+						logging.info('# Copying {} key to: {}'.format(key, target))
+						shutil.copy2(path, target)
+
+			for cmd in _itery(obj.get('deploy', None)):
+				cmd = cmd.replace('{name}', name).replace('{type}', key_type) \
+						.replace('{privkey}', keypath).replace('{fullchain}', fullchainpath) \
+						.replace('{cert}', certpath).replace('{chain}', chainpath)
+				logging.info('# Running deploy script: %s', cmd)
+				r = subprocess.run(cmd, shell=True)
+				if r.returncode != 0:
+					logging.info(' ! Returned with non-zero returncode: %s', r.returncode)
+					error = 1
+			logging.info('----- ----- -----')
 
 	if issued > 0:
 		for cmd in _itery(config.get('alldone', None)):
@@ -983,9 +1087,9 @@ if __name__ == "__main__":
 	parser.add_argument('-fk', '--force-key', action='store_true', help='force private key rotation when renewing certificates')
 	parser.add_argument('-r', '--revoke', metavar='name', help='revoke one certificate')
 	parser.add_argument('-ra', '--revoke-all', action='store_true', help='revoke all certificates')
-	parser.add_argument('-t', '--key-type', default='ec-384', metavar='type',
-		choices=SUPPORTED_CRYPTO.keys(),
-		help='Key type to generate. Valid choices: %(choices)s (default: %(default)s)')
+	parser.add_argument('-t', '--key-types', nargs='+', default=None, metavar='type',
+		choices=list(SUPPORTED_CRYPTO.keys()),
+		help='Key types to generate. Valid choices: %(choices)s (default: {})'.format(DEFAULT_KEY_TYPES))
 	parser.add_argument('--email', help='e-mail address used for account registration')
 	parser.add_argument('--staging', action='store_true', help='use Let\'s Encrypt staging server')
 	parser.add_argument('--acme-server', metavar='URL', default=None, help='custom ACME server')
@@ -1035,6 +1139,12 @@ if __name__ == "__main__":
 	if args.acme_server is None:
 		args.acme_server = config.get('acme_server', ACME_SERVER)
 
+	if args.key_types is None:
+		args.key_types = _itery(config.get('type', DEFAULT_KEY_TYPES))
+		for key_type in args.key_types:
+			if key_type not in SUPPORTED_CRYPTO:
+				parser.error('! Unsupported key type {} in config'.format(key_type))
+
 	o = urllib.parse.urlparse(args.acme_server)
 	if not o.scheme:
 		o.scheme = 'https'
@@ -1044,4 +1154,3 @@ if __name__ == "__main__":
 	ret = main(args, config)
 	if ret != 0:
 		sys.exit(ret)
-
